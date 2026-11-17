@@ -237,18 +237,18 @@ NV.Police = {
   cars: [],
   spawnOne: function (scene, world, playerPos) {
     // Spawn at a road intersection at least 55 units away from the player.
-    var best = null, bestD = -1;
+    var best = null, bestD = -1, bi = 0, bj = 0;
     for (var i = 0; i < NV.CITY.roadCenters.length; i++) {
       for (var j = 0; j < NV.CITY.roadCenters.length; j++) {
         var x = NV.CITY.roadCenters[i], z = NV.CITY.roadCenters[j];
         var d = NV.dist2(x, z, playerPos.x, playerPos.z);
-        if (d > 55 && d < 150 && d > bestD) { bestD = d; best = { x: x, z: z }; }
+        if (d > 55 && d < 150 && d > bestD) { bestD = d; best = { x: x, z: z }; bi = i; bj = j; }
       }
     }
     if (!best) best = { x: NV.CITY.roadCenters[0], z: NV.CITY.roadCenters[0] };
     var car = new NV.Car(scene, { x: best.x, z: best.z, heading: 0, color: 0xf2f2f2, police: true });
     car.driver = 'police';
-    car.ai = { ramCooldown: 0, escapeTime: 0, escapeTarget: null };
+    car.ai = { ramCooldown: 0, escapeTime: 0, escapeTarget: null, anchorX: best.x, anchorZ: best.z, anchorTime: 0, gx: bi, gz: bj };
     this.cars.push(car);
     return car;
   },
@@ -264,31 +264,55 @@ NV.Police = {
       var p = car.pos();
       var d = NV.dist2(p.x, p.z, target.x, target.z);
       if (d > 260) { this.remove(world.scene, car); continue; }
-      // Steer point: the player, unless we are wedged — then the nearest open
-      // intersection, which always connects back to the road grid.
+      // Steer point: while far away, follow the road grid from intersection
+      // to intersection, greedily closing on the player — a straight line
+      // to the player crosses solid blocks and the car just wedges on a
+      // building. Close in (or while escaping a wedge), steer directly.
       var steerTarget = target;
       if (car.ai.escapeTime > 0) {
         car.ai.escapeTime -= dt;
         steerTarget = car.ai.escapeTarget;
         if (NV.dist2(p.x, p.z, steerTarget.x, steerTarget.z) < 5) car.ai.escapeTime = 0;
+      } else if (d > 26) {
+        var gx = car.ai.gx, gz = car.ai.gz;
+        var tx = NV.CITY.roadCenters[gx], tz = NV.CITY.roadCenters[gz];
+        if (NV.dist2(p.x, p.z, tx, tz) < 6) {
+          var opts = [[1, 0], [-1, 0], [0, 1], [0, -1]], bo = null, bd2 = 1e9;
+          for (var oi = 0; oi < 4; oi++) {
+            var nx = gx + opts[oi][0], nz = gz + opts[oi][1];
+            if (nx < 0 || nz < 0 || nx > NV.CITY.GRID || nz > NV.CITY.GRID) continue;
+            var dd2 = NV.dist2(NV.CITY.roadCenters[nx], NV.CITY.roadCenters[nz], target.x, target.z);
+            if (dd2 < bd2) { bd2 = dd2; bo = [nx, nz]; }
+          }
+          if (bo) {
+            car.ai.gx = bo[0]; car.ai.gz = bo[1];
+            tx = NV.CITY.roadCenters[bo[0]]; tz = NV.CITY.roadCenters[bo[1]];
+          }
+        }
+        steerTarget = { x: tx, z: tz };
       }
       var desired = Math.atan2(steerTarget.x - p.x, steerTarget.z - p.z);
       var diff = NV.wrapAngle(desired - car.heading);
-      // Unstick: barely moving while trying means a wall has us. Head for the
+      // Unstick: judge progress over a window, not instant speed. A car
+      // wedged on a building bounces (hit, recoil, accelerate, hit again),
+      // so its speed rarely stays near zero long enough for a speed check
+      // to notice — but over 1.4 s it has gone nowhere. Head for the
       // nearest intersection instead of grinding against the building.
-      if (Math.abs(car.speed) < 0.6 && car.ai.escapeTime <= 0) car.stuckTime += dt;
-      else if (car.ai.escapeTime <= 0) car.stuckTime = 0;
-      if (car.stuckTime > 1.1) {
-        var bx = NV.CITY.roadCenters[0], bz = NV.CITY.roadCenters[0], bd = 1e9;
-        for (var a = 0; a < NV.CITY.roadCenters.length; a++) {
-          for (var b = 0; b < NV.CITY.roadCenters.length; b++) {
-            var dd = NV.dist2(p.x, p.z, NV.CITY.roadCenters[a], NV.CITY.roadCenters[b]);
-            if (dd < bd) { bd = dd; bx = NV.CITY.roadCenters[a]; bz = NV.CITY.roadCenters[b]; }
+      // Skipped while already escaping, and while on top of the player
+      // (barely moving there means it is engaging, not stuck).
+      if (car.ai.escapeTime <= 0 && d > 6 && time - car.ai.anchorTime > 1.4) {
+        if (NV.dist2(p.x, p.z, car.ai.anchorX, car.ai.anchorZ) < 2.5) {
+          var bx = NV.CITY.roadCenters[0], bz = NV.CITY.roadCenters[0], bd = 1e9;
+          for (var a = 0; a < NV.CITY.roadCenters.length; a++) {
+            for (var b = 0; b < NV.CITY.roadCenters.length; b++) {
+              var dd = NV.dist2(p.x, p.z, NV.CITY.roadCenters[a], NV.CITY.roadCenters[b]);
+              if (dd < bd) { bd = dd; bx = NV.CITY.roadCenters[a]; bz = NV.CITY.roadCenters[b]; }
+            }
           }
+          car.ai.escapeTarget = { x: bx, z: bz };
+          car.ai.escapeTime = 2.2;
         }
-        car.ai.escapeTarget = { x: bx, z: bz };
-        car.ai.escapeTime = 2.2;
-        car.stuckTime = 0;
+        car.ai.anchorX = p.x; car.ai.anchorZ = p.z; car.ai.anchorTime = time;
       }
       car.steer = NV.clamp(diff * 1.9, -1, 1);
       car.heading += car.steer * 2.0 * dt * NV.clamp(Math.abs(car.speed) / 6 + 0.3, 0, 1) * (car.speed < 0 ? -1 : 1);

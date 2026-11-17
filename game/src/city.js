@@ -176,6 +176,17 @@ NV.buildCity = function (scene) {
   var world = { colliders: colliders };
   NV.world = world;
 
+  // Apron: a broad sand plain under and around the city, so the ground does
+  // not end in mid-air at the map edge — streets at the border look out over
+  // the coastal flat instead of the sky.
+  var apron = new THREE.Mesh(
+    new THREE.PlaneGeometry(2400, 2400),
+    new THREE.MeshLambertMaterial({ color: 0x8d8168 })
+  );
+  apron.rotation.x = -Math.PI / 2;
+  apron.position.y = -0.2;
+  scene.add(apron);
+
   // Ground.
   var ground = new THREE.Mesh(
     new THREE.PlaneGeometry(NV.CITY.SPAN, NV.CITY.SPAN),
@@ -324,13 +335,16 @@ NV.buildCity = function (scene) {
       NV.randPick(rng, NV.CITY.roadCenters) + NV.randRange(rng, -4, 4), rng() * 1.5);
   }
 
-  // Distant silhouette towers in the haze, outside the playable grid.
-  var silMat = new THREE.MeshBasicMaterial({ color: 0x8fa3b5 });
+  // Distant silhouette towers in the haze, outside the playable grid. Each
+  // stands on the ground (base at y=0) and is a touch darker than the sky,
+  // so it reads as a hazy tower rather than a hole in the sky.
+  var silMat = new THREE.MeshBasicMaterial({ color: 0x7490a8 });
   for (var s = 0; s < 16; s++) {
     var ang = (s / 16) * Math.PI * 2;
     var rad = NV.randRange(rng, 300, 400);
-    var tower = new THREE.Mesh(new THREE.BoxGeometry(30, NV.randRange(rng, 40, 110), 30), silMat);
-    tower.position.set(Math.cos(ang) * rad, 25, Math.sin(ang) * rad);
+    var silH = NV.randRange(rng, 40, 110);
+    var tower = new THREE.Mesh(new THREE.BoxGeometry(30, silH, 30), silMat);
+    tower.position.set(Math.cos(ang) * rad, silH / 2, Math.sin(ang) * rad);
     scene.add(tower);
   }
 

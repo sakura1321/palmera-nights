@@ -6,7 +6,11 @@
 'use strict';
 
 (function () {
-  var rng = NV.makeRng(112233);
+  // URL params drive only the screenshot/test hook at the bottom of this file
+  // (and an optional layout seed); normal play passes none and is unchanged.
+  var params = new URLSearchParams(window.location.search);
+  var seedParam = parseInt(params.get('seed'), 10);
+  var rng = NV.makeRng(isNaN(seedParam) ? 112233 : seedParam);
 
   // --- Scene -------------------------------------------------------------
   var container = document.getElementById('scene');
@@ -54,7 +58,7 @@
   // --- Cars -----------------------------------------------------------------
   var allCars = [];
   // The player's own car, parked by the spawn: taking it is never a crime.
-  var ownCar = new NV.Car(scene, { x: 6.5, z: 175, heading: Math.PI / 2, color: 0x1fa8a0, own: true });
+  var ownCar = new NV.Car(scene, { x: 6.5, z: 177.6, heading: Math.PI / 2, color: 0x1fa8a0, own: true });
   allCars.push(ownCar);
   // Parked cars along the curbs, waiting to be stolen.
   for (var pi = 0; pi < 10; pi++) {
@@ -545,6 +549,38 @@
     updateCamera(dt);
     renderer.render(scene, camera);
   }
+  // --- Screenshot / automated-test hook -------------------------------------
+  // Headless browsers cannot hold pointer lock, so the title screen's click
+  // flow cannot start a test run. With ?autostart=1 (or a ?shot scene other
+  // than "start") the game starts directly, without pointer lock; keyboard
+  // input works as usual and the camera keeps its default follow position.
+  // ?shot=<scene> stages the scenes named in shots.json: start (the title
+  // orbit, untouched), play (on foot at spawn), drive (in your car on the
+  // z=111 road, throttle held by the script) and chase (the same drive with
+  // a 3-star wanted level, so the police response is real gameplay).
+  var shotScene = params.get('shot');
+  if (params.has('autostart') || (shotScene && shotScene !== 'start')) {
+    NV.Sound.init();
+    el.startScreen.style.display = 'none';
+    el.hud.style.display = 'block';
+    G.state = 'playing';
+    if (shotScene === 'drive' || shotScene === 'chase') {
+      ownCar.mesh.position.set(-150, 0, 108.7); // eastbound lane of the z=111 road, city on both sides
+      ownCar.heading = Math.PI / 2;
+      ownCar.syncMesh();
+      ownCar.driver = 'player';
+      player.car = ownCar;
+      player.mode = 'car';
+      player.mesh.visible = false;
+      G.camYaw = ownCar.heading;
+      keys.KeyW = true; // scripted throttle: the car drives itself east
+      if (shotScene === 'chase') {
+        G.wanted.heat = 3;
+        G.wanted.lastCrime = 0;
+      }
+    }
+  }
+
   el.objective.textContent = OBJECTIVES[0];
   frame();
 })();
