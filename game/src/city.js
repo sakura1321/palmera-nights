@@ -26,18 +26,19 @@ NV.blockOrigin = function (i, j) {
 };
 
 // Facade texture: a light, tintable wall with a grid of windows, some of them lit.
+// Painted at 256x512 so windows stay crisp when the player walks right up to a wall.
 function facadeTexture(rng, litRatio) {
-  return NV.canvasTexture(NV.makeCanvas(128, 256, function (g, w, h) {
+  return NV.canvasTexture(NV.makeCanvas(256, 512, function (g, w, h) {
     g.fillStyle = '#d8d5cc';
     g.fillRect(0, 0, w, h);
-    var cols = 6, rows = 12, ww = w / cols, wh = h / rows;
+    var cols = 8, rows = 16, ww = w / cols, wh = h / rows;
     for (var y = 0; y < rows; y++) {
       for (var x = 0; x < cols; x++) {
         var lit = rng() < litRatio;
         g.fillStyle = lit ? '#ffca7a' : '#33475c';
-        g.fillRect(x * ww + 3, y * wh + 4, ww - 6, wh - 8);
+        g.fillRect(x * ww + 4, y * wh + 5, ww - 8, wh - 10);
         g.fillStyle = 'rgba(255,255,255,0.25)';
-        g.fillRect(x * ww + 3, y * wh + 4, ww - 6, 3);
+        g.fillRect(x * ww + 4, y * wh + 5, ww - 8, 4);
       }
     }
   }));
@@ -209,6 +210,7 @@ NV.buildCity = function (scene) {
     return new THREE.Mesh(geo, [side, side, roofMat, roofMat, side, side]);
   }
 
+  var emptyPlots = []; // plots the building pass skipped, dressed as lots below
   for (var i = 0; i < NV.CITY.GRID; i++) {
     for (var j = 0; j < NV.CITY.GRID; j++) {
       if (i === 4 && j === 4) continue; // the garage block, built below
@@ -216,7 +218,10 @@ NV.buildCity = function (scene) {
       var centreBoost = 1 - (Math.abs(i - 2) + Math.abs(j - 2)) / 6;
       for (var a = 0; a < 2; a++) {
         for (var b = 0; b < 2; b++) {
-          if (rng() < 0.12) continue; // a few empty plots break up the grid
+          if (rng() < 0.12) { // a few empty plots break up the grid
+            emptyPlots.push({ x: o.x + 14 + a * 28, z: o.z + 14 + b * 28 });
+            continue;
+          }
           var w = NV.randRange(rng, 19, 25), d = NV.randRange(rng, 19, 25);
           var h = 10 + centreBoost * 26 + rng() * 15;
           var cx = o.x + 14 + a * 28, cz = o.z + 14 + b * 28;
@@ -334,6 +339,65 @@ NV.buildCity = function (scene) {
       NV.randPick(rng, NV.CITY.roadCenters) + NV.randRange(rng, -4, 4),
       NV.randPick(rng, NV.CITY.roadCenters) + NV.randRange(rng, -4, 4), rng() * 1.5);
   }
+
+  // Block interiors: the plots no building took become parking lots, a couple of
+  // basketball courts, or crate yards, so blocks are places and not just facades.
+  // Parking lots report car spots to the game (world.parkingSpots) so real,
+  // stealable cars wait in them.
+  var dumpsterMat = new THREE.MeshLambertMaterial({ color: 0x3f6b4f });
+  var slabGeo = new THREE.PlaneGeometry(26, 26);
+  world.parkingSpots = [];
+  function addSlab(x, z, color) {
+    var slab = new THREE.Mesh(slabGeo, new THREE.MeshLambertMaterial({ color: color }));
+    slab.rotation.x = -Math.PI / 2;
+    slab.position.set(x, 0.03, z);
+    scene.add(slab);
+  }
+  function addHoop(x, z, ry) {
+    var hoop = new THREE.Group();
+    var pole = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 3.6, 6),
+      new THREE.MeshLambertMaterial({ color: 0x3a3f45 }));
+    pole.position.y = 1.8;
+    hoop.add(pole);
+    var board = new THREE.Mesh(new THREE.BoxGeometry(1.7, 1.1, 0.08),
+      new THREE.MeshLambertMaterial({ color: 0xe8e4da }));
+    board.position.set(0, 3.3, 0.35);
+    hoop.add(board);
+    var rim = new THREE.Mesh(new THREE.TorusGeometry(0.28, 0.035, 6, 12),
+      new THREE.MeshBasicMaterial({ color: 0xe06426 }));
+    rim.rotation.x = Math.PI / 2;
+    rim.position.set(0, 3.0, 0.62);
+    hoop.add(rim);
+    hoop.position.set(x, 0, z);
+    hoop.rotation.y = ry;
+    scene.add(hoop);
+    colliders.push({ minX: x - 0.3, maxX: x + 0.3, minZ: z - 0.3, maxZ: z + 0.3 });
+  }
+  emptyPlots.forEach(function (plot, idx) {
+    var kind = rng();
+    if (kind < 0.55) {
+      // Parking lot: dark slab, a dumpster and crates at the edges, car spots.
+      addSlab(plot.x, plot.z, 0x3a3e44);
+      addProp(dumpsterMat, 2.4, 1.35, 1.25, plot.x - 10.5, plot.z - 10.5, 0.2);
+      addProp(crateMat, 1.3, 1.3, 1.3, plot.x + 11, plot.z + 10, rng() * 1.5);
+      addProp(crateMat, 1.3, 1.3, 1.3, plot.x + 11, plot.z + 8.4, rng() * 1.5);
+      world.parkingSpots.push({ x: plot.x - 5, z: plot.z + 1, heading: Math.PI / 2 });
+      world.parkingSpots.push({ x: plot.x + 5, z: plot.z + 1, heading: -Math.PI / 2 });
+      if (idx % 2 === 0) world.parkingSpots.push({ x: plot.x, z: plot.z - 7, heading: 0 });
+    } else if (kind < 0.8) {
+      // Basketball court: warm slab, a hoop at one end, crates as the bench.
+      addSlab(plot.x, plot.z, 0x8a5a44);
+      addHoop(plot.x, plot.z - 11, 0);
+      addProp(crateMat, 1.3, 1.3, 1.3, plot.x - 11, plot.z + 11, rng() * 1.5);
+      addProp(dumpsterMat, 2.4, 1.35, 1.25, plot.x + 10.5, plot.z + 11, -0.15);
+    } else {
+      // Crate yard: stacks and a dumpster, good cover in a chase.
+      addProp(crateMat, 1.3, 1.3, 1.3, plot.x - 3, plot.z - 2, rng() * 1.5);
+      addProp(crateMat, 1.3, 1.3, 1.3, plot.x - 3, plot.z - 0.5, rng() * 1.5);
+      addProp(crateMat, 1.3, 1.3, 1.3, plot.x + 2, plot.z + 3, rng() * 1.5);
+      addProp(dumpsterMat, 2.4, 1.35, 1.25, plot.x + 6, plot.z - 5, 0.4);
+    }
+  });
 
   // Distant silhouette towers in the haze, outside the playable grid. Each
   // stands on the ground (base at y=0) and is a touch darker than the sky,

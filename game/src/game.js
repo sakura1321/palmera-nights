@@ -1,8 +1,10 @@
 // game.js — Palmera Nights, the playable loop. Owns the scene, the player (on foot
-// and in cars), the wanted system and police response, the two-mission opening chain,
-// the HUD and minimap, and the title / pause flow. Other files build the world
-// (city.js), the cars and their AI (vehicles.js), the crowd (people.js), the sound
-// (audio.js) and the helpers (util.js); this file wires them together.
+// and in cars), the wanted system and police response, Rosa Delgado's five-mission
+// chain, fists-and-pistol combat, the localStorage save, the HUD and minimap, and
+// the title / pause flow. The world steps at a fixed 120 Hz so speed never depends
+// on the frame rate. Other files build the world (city.js), the cars and their AI
+// (vehicles.js), the crowd (people.js), the sound (audio.js) and the helpers
+// (util.js); this file wires them together.
 'use strict';
 
 (function () {
@@ -36,7 +38,9 @@
   // --- DOM ----------------------------------------------------------------
   var el = {};
   ['startScreen', 'pauseScreen', 'hud', 'healthFill', 'money', 'stars', 'speed',
-   'objective', 'prompt', 'toast', 'minimap', 'wantedLabel'].forEach(function (id) {
+   'objective', 'prompt', 'toast', 'minimap', 'wantedLabel', 'weapon', 'timer',
+   'crosshair', 'playHint', 'menuButtons', 'continueBtn', 'newGameBtn',
+   'saveBtn', 'saveNote'].forEach(function (id) {
     el[id] = document.getElementById(id);
   });
   var mapCtx = el.minimap.getContext('2d');
@@ -50,7 +54,15 @@
     mode: 'foot',          // 'foot' or 'car'
     car: null,
     walkPhase: 0,
-    bustTimer: 0
+    bustTimer: 0,
+    // Combat: a pistol taken at the garage, its magazine and spare rounds,
+    // and the clocks that pace punches, shots and the reload.
+    hasPistol: false,
+    ammo: 0,
+    reserve: 0,
+    attackCd: 0,
+    reloadAt: 0,
+    punchUntil: 0
   };
   player.mesh.position.set(world.spawn.x, 0, world.spawn.z);
   scene.add(player.mesh);
@@ -76,6 +88,15 @@
   }
   var trafficCars = NV.Traffic.spawn(scene, rng, 8);
   allCars = allCars.concat(trafficCars);
+  // More parked cars wait in the parking lots city.js dressed (world.parkingSpots).
+  (world.parkingSpots || []).forEach(function (spot, si) {
+    if (si % 2 === 1) return; // leave half the spots empty
+    var lotCar = new NV.Car(scene, {
+      x: spot.x, z: spot.z, heading: spot.heading,
+      color: NV.randPick(rng, CAR_COLORS)
+    });
+    allCars.push(lotCar);
+  });
   NV.Peds.spawn(scene, rng, 14);
 
   // --- Game state -------------------------------------------------------------
@@ -87,15 +108,93 @@
     driveYawOffset: 0,
     wanted: { heat: 0, lastCrime: -99 },
     policeCooldown: 0,
-    mission: 0,            // 0 reach garage, 1 deliver a stolen car, 2 free roam
+    mission: 0,            // index into the chain below; 5 = chain done, free roam
+    md: {},                // per-mission scratch state, set by startMission
     toastUntil: 0
   };
   var keys = {};
   var OBJECTIVES = [
     'Reach Delgado Auto Works — follow the gold marker',
     'Steal any car and deliver it to the garage apron',
-    'Free roam — Palmera is yours. Make money, dodge the PPD'
+    'Special delivery: take Rosa\'s gold car across town before the clock runs out',
+    'Pick up the package across town, then bring it to the garage — expect heat',
+    'Repo job: steal the marked purple car and bring it back to the garage',
+    'Free roam — Palmera is yours. Stolen cars fetch $150 scrap at the garage'
   ];
+  // Mission geography: the drop is the north-west intersection, the package
+  // waits in the south-west, the repo car is parked up north.
+  var DROP_POINT = { x: -111, z: -111, r: 12 };
+  var PACKAGE_POINT = { x: -158, z: 148 };
+  var REPO_SPOT = { x: 44.4, z: -52, heading: 0 };
+  var deliveryCar = null;  // Rosa's gold car, spawned for mission 2
+  var repoCar = null;      // the marked car of mission 4
+  var owner = null;        // the repo car's angry owner, a guard NPC
+
+  // The gold beacon that marks the current objective in the world: a soft
+  // pillar of light you can see across rooftops, with a spinning diamond.
+  var marker = new THREE.Group();
+  var pillar = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.5, 1.5, 34, 12, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0xffd94d, transparent: true, opacity: 0.28,
+      side: THREE.DoubleSide, depthWrite: false
+    })
+  );
+  pillar.position.y = 17;
+  marker.add(pillar);
+  var gem = new THREE.Mesh(
+    new THREE.OctahedronGeometry(0.85),
+    new THREE.MeshBasicMaterial({ color: 0xffd94d })
+  );
+  gem.position.y = 3.4;
+  marker.add(gem);
+  scene.add(marker);
+
+  // The package of mission 3: a small bright case, waiting to be picked up.
+  var packageMesh = new THREE.Mesh(
+    new THREE.BoxGeometry(0.62, 0.3, 0.44),
+    new THREE.MeshBasicMaterial({ color: 0xffb52e })
+  );
+  packageMesh.position.set(PACKAGE_POINT.x, 0.35, PACKAGE_POINT.z);
+  packageMesh.visible = false;
+  scene.add(packageMesh);
+
+  // The pistol pickup at the garage: a dark little gun on a gold pad. It
+  // appears once the intro chain is done; taking it also refills the ammo.
+  var PISTOL_POINT = { x: world.garage.x - 9, z: world.garage.z - 4 };
+  var pistolMesh = new THREE.Group();
+  var pad = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.85, 0.85, 0.08, 16),
+    new THREE.MeshBasicMaterial({ color: 0xffd94d })
+  );
+  pad.position.y = 0.04;
+  pistolMesh.add(pad);
+  var gunBody = new THREE.Mesh(
+    new THREE.BoxGeometry(0.16, 0.14, 0.52),
+    new THREE.MeshLambertMaterial({ color: 0x22242a })
+  );
+  gunBody.position.y = 0.3;
+  pistolMesh.add(gunBody);
+  var gunGrip = new THREE.Mesh(
+    new THREE.BoxGeometry(0.13, 0.3, 0.16),
+    new THREE.MeshLambertMaterial({ color: 0x3a2c1c })
+  );
+  gunGrip.position.set(0, 0.14, -0.16);
+  pistolMesh.add(gunGrip);
+  pistolMesh.position.set(PISTOL_POINT.x, 0, PISTOL_POINT.z);
+  pistolMesh.visible = false;
+  scene.add(pistolMesh);
+
+  // Muzzle flash: a bright sphere plus a point light, lit for a few frames.
+  var flashMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.17, 8, 6),
+    new THREE.MeshBasicMaterial({ color: 0xffe9a0 })
+  );
+  flashMesh.visible = false;
+  scene.add(flashMesh);
+  var flashLight = new THREE.PointLight(0xffc266, 0, 16);
+  scene.add(flashLight);
+  var flashUntil = 0;
 
   function stars() {
     if (G.wanted.heat <= 0.05) return 0;
@@ -111,7 +210,10 @@
   // Crime raises heat; nearby pedestrians panic. Witnessed thefts cost a full star,
   // quiet ones much less; running someone down is the worst everyday crime.
   function commitCrime(kind, pos) {
-    var add = { theft: 1.0, theftQuiet: 0.35, hitPed: 2.0, hitCar: 0.6, hitPolice: 1.2 }[kind] || 0.5;
+    var add = {
+      theft: 1.0, theftQuiet: 0.35, hitPed: 2.0, hitCar: 0.6, hitPolice: 1.2,
+      assault: 0.7, shooting: 2.2
+    }[kind] || 0.5;
     G.wanted.heat = Math.min(6, G.wanted.heat + add);
     G.wanted.lastCrime = G.time;
     NV.Peds.startleNear(pos, 17);
@@ -130,7 +232,15 @@
     player.money = Math.max(0, player.money - fine);
     G.wanted.heat = 0;
     clearPolice();
-    toast(label + ' — $' + fine + ' gone. You are back on the street.', 4);
+    // Caught or hospitalised while carrying the package: it is gone, and
+    // Rosa's pickup has to be run again from the top.
+    var note = '';
+    if (G.mission === 3 && G.md.carrying) {
+      G.md.carrying = false;
+      packageMesh.visible = true;
+      note = ' The package is gone — fetch it again.';
+    }
+    toast(label + ' — $' + fine + ' gone. You are back on the street.' + note, 4);
   }
 
   // --- Input ------------------------------------------------------------------
@@ -142,8 +252,17 @@
       toast(muted ? 'Sound off' : 'Sound on', 1.2);
     }
     if (e.code === 'KeyE' && G.state === 'playing') tryInteract();
+    if (e.code === 'KeyF' && G.state === 'playing') tryPunch();
+    if (e.code === 'KeyR' && G.state === 'playing') tryReload();
   });
   document.addEventListener('keyup', function (e) { keys[e.code] = false; });
+  // Left mouse: shoot when armed, punch when not. Clicks that start or resume
+  // the game land while the state is still title/paused, so they never attack.
+  document.addEventListener('mousedown', function (e) {
+    if (e.button !== 0 || G.state !== 'playing' || player.mode !== 'foot') return;
+    if (player.hasPistol) tryShoot();
+    else tryPunch();
+  });
   document.addEventListener('mousemove', function (e) {
     if (G.state !== 'playing' || document.pointerLockElement !== renderer.domElement) return;
     if (player.mode === 'car') {
@@ -169,8 +288,98 @@
     el.hud.style.display = 'block';
     G.state = 'playing';
   }
-  el.startScreen.addEventListener('click', lockAndPlay);
+
+  // --- Save / load ----------------------------------------------------------
+  // One localStorage slot: money, health, mission progress, where the player
+  // stands and the car they were driving (boot cars restore exactly; anything
+  // else respawns on foot at the saved spot). Wanted is always cleared.
+  var SAVE_KEY = 'palmera-nights-save-v1';
+  function hasSave() {
+    try { return !!window.localStorage.getItem(SAVE_KEY); } catch (e) { return false; }
+  }
+  function saveGame(announce) {
+    try {
+      var pt = playerPoint();
+      var carIdx = -1, stolen = false;
+      if (player.mode === 'car' && player.car &&
+          NV.Traffic.cars.indexOf(player.car) === -1 && !player.car.police) {
+        carIdx = allCars.indexOf(player.car);
+        stolen = !!player.car.stolen;
+      }
+      var data = {
+        money: Math.floor(player.money),
+        health: Math.round(player.health),
+        mission: G.mission,
+        x: pt.x, z: pt.z,
+        heading: player.mode === 'car' && player.car ? player.car.heading : player.heading,
+        carIdx: carIdx, stolen: stolen,
+        carX: player.car ? player.car.pos().x : 0,
+        carZ: player.car ? player.car.pos().z : 0,
+        hasPistol: player.hasPistol, ammo: player.ammo, reserve: player.reserve
+      };
+      window.localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+      if (announce) toast('Saved', 1.4);
+      return true;
+    } catch (e) { return false; }
+  }
+  function applySave() {
+    var data = null;
+    try { data = JSON.parse(window.localStorage.getItem(SAVE_KEY)); } catch (e) { /* no save */ }
+    if (!data) return false;
+    player.money = data.money || 0;
+    player.health = NV.clamp(data.health || 100, 25, 100);
+    player.hasPistol = !!data.hasPistol;
+    player.ammo = data.ammo || 0;
+    player.reserve = data.reserve || 0;
+    G.mission = NV.clamp(data.mission || 0, 0, OBJECTIVES.length - 1);
+    startMission(G.mission); // rebuilds this mission's props and objective
+    G.wanted.heat = 0;
+    clearPolice();
+    if (data.carIdx >= 0 && allCars[data.carIdx]) {
+      var car = allCars[data.carIdx];
+      car.mesh.position.set(data.carX, 0, data.carZ);
+      car.heading = data.heading || 0;
+      car.speed = 0;
+      car.stolen = !!data.stolen;
+      car.syncMesh();
+      car.driver = 'player';
+      player.car = car;
+      player.mode = 'car';
+      player.mesh.visible = false;
+      G.camYaw = car.heading;
+    } else {
+      player.mesh.position.set(data.x || world.spawn.x, 0, data.z || world.spawn.z);
+      player.heading = data.heading || Math.PI;
+      G.camYaw = player.heading;
+    }
+    el.objective.textContent = OBJECTIVES[G.mission];
+    return true;
+  }
+  function refreshStartMenu() {
+    var saved = hasSave();
+    el.menuButtons.style.display = saved ? 'flex' : 'none';
+    el.playHint.textContent = saved ? 'CLICK TO CONTINUE' : 'CLICK TO PLAY';
+  }
+  el.startScreen.addEventListener('click', function () {
+    if (hasSave()) applySave();
+    lockAndPlay();
+  });
+  el.continueBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    applySave();
+    lockAndPlay();
+  });
+  el.newGameBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    try { window.localStorage.removeItem(SAVE_KEY); } catch (err) { /* ignore */ }
+    window.location.reload(); // a fresh world, no half-reset state
+  });
   el.pauseScreen.addEventListener('click', lockAndPlay);
+  el.saveBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    el.saveNote.textContent = saveGame(false) ? 'Game saved' : 'Save failed — storage unavailable';
+  });
+  refreshStartMenu();
   window.addEventListener('resize', function () {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
@@ -190,19 +399,37 @@
     return best;
   }
 
+  function exitCar() {
+    var car = player.car;
+    var f = car.forward();
+    player.mesh.position.set(car.pos().x - f.z * 2.0, 0, car.pos().z + f.x * 2.0);
+    NV.resolveCircle(player.mesh.position, 0.45, world.colliders);
+    player.mesh.visible = true;
+    player.heading = car.heading;
+    car.driver = null;
+    player.car = null;
+    player.mode = 'foot';
+    NV.Sound.engine(false, 0, 0);
+  }
+
+  function nearPistol() {
+    return G.mission >= 2 && player.mode === 'foot' &&
+      NV.dist2(player.mesh.position.x, player.mesh.position.z,
+        PISTOL_POINT.x, PISTOL_POINT.z) < 2.4;
+  }
+
   function tryInteract() {
-    if (player.mode === 'car') {
-      // Step out on the car's right side.
-      var car = player.car;
-      var f = car.forward();
-      player.mesh.position.set(car.pos().x - f.z * 2.0, 0, car.pos().z + f.x * 2.0);
-      NV.resolveCircle(player.mesh.position, 0.45, world.colliders);
-      player.mesh.visible = true;
-      player.heading = car.heading;
-      car.driver = null;
-      player.car = null;
-      player.mode = 'foot';
-      NV.Sound.engine(false, 0, 0);
+    if (player.mode === 'car') { exitCar(); return; }
+    // The pistol at the garage comes before car doors: it sits on the apron.
+    if (nearPistol()) {
+      var fresh = !player.hasPistol;
+      player.hasPistol = true;
+      player.ammo = 12;
+      player.reserve = 48;
+      player.reloadAt = 0;
+      NV.Sound.jingle();
+      toast(fresh ? 'You take Rosa\'s pistol. Click to shoot, R to reload.'
+                  : 'Pistol reloaded — Rosa keeps the ammo box full.', 3);
       return;
     }
     var target = nearestEnterableCar();
@@ -218,6 +445,133 @@
       commitCrime(witness ? 'theft' : 'theftQuiet', target.pos());
       toast(witness ? 'Grand theft — and somebody saw it.' : 'Grand theft — nobody saw a thing.', 2.5);
     }
+  }
+
+  // --- Combat -------------------------------------------------------------------
+  // Fists and the pistol, both on foot. Attacks aim where the camera looks:
+  // a punch checks a short cone ahead, a shot casts a ray from the camera and
+  // takes the nearest body or car it passes close enough to.
+  function lookDir() {
+    var v = new THREE.Vector3();
+    camera.getWorldDirection(v);
+    return v;
+  }
+
+  // Is this figure inside the punch cone / the bullet's path? Returns the
+  // distance along the look direction, or -1 for a miss.
+  function aimScore(origin, dir, px, py, pz, radius) {
+    var vx = px - origin.x, vy = py - origin.y, vz = pz - origin.z;
+    var t = vx * dir.x + vy * dir.y + vz * dir.z;
+    if (t < 0.4) return -1;
+    var cx = origin.x + dir.x * t, cy = origin.y + dir.y * t, cz = origin.z + dir.z * t;
+    var d2 = (px - cx) * (px - cx) + (py - cy) * (py - cy) + (pz - cz) * (pz - cz);
+    return d2 < radius * radius ? t : -1;
+  }
+
+  function hitFigure(fig, byGun) {
+    // fig: {ped} for a pedestrian, {owner:true} for the repo car's owner.
+    if (fig.owner) {
+      if (!owner || !owner.active || G.time < owner.downUntil) return;
+      owner.downUntil = G.time + (byGun ? 30 : 4);
+      owner.mesh.rotation.x = -Math.PI / 2;
+      owner.mesh.position.y = 0.2;
+      NV.Sound.thud(0.6);
+      return;
+    }
+    var ped = fig.ped;
+    if (ped.state === 'down') return;
+    if (ped.knockDown()) {
+      if (byGun) ped.downTime = 45; // shot victims stay down
+      NV.Sound.thud(byGun ? 0.5 : 0.45);
+    }
+  }
+
+  function tryPunch() {
+    if (player.mode !== 'foot' || G.time < player.attackCd) return;
+    player.attackCd = G.time + 0.38;
+    player.punchUntil = G.time + 0.22;
+    var p = player.mesh.position;
+    var origin = { x: p.x, y: 1.3, z: p.z };
+    var dir = lookDir();
+    var best = null, bestT = 2.6;
+    for (var i = 0; i < NV.Peds.list.length; i++) {
+      var ped = NV.Peds.list[i];
+      if (ped.state === 'down') continue;
+      var pp = ped.pos();
+      var t = aimScore(origin, dir, pp.x, 1.0, pp.z, 1.05);
+      if (t > 0 && t < bestT) { bestT = t; best = { ped: ped }; }
+    }
+    if (owner && owner.active && G.time >= owner.downUntil) {
+      var op = owner.mesh.position;
+      var ot = aimScore(origin, dir, op.x, 1.0, op.z, 1.05);
+      if (ot > 0 && ot < bestT) { bestT = ot; best = { owner: true }; }
+    }
+    if (best) {
+      hitFigure(best, false);
+      // A witnessed assault is a crime, a quiet one is just a bad day.
+      if (NV.Peds.anyWitness(p, 20)) {
+        commitCrime('assault', p);
+        toast('You decked them in front of witnesses.', 2);
+      }
+    }
+  }
+
+  function tryShoot() {
+    if (player.mode !== 'foot' || !player.hasPistol) return;
+    if (G.time < player.attackCd || G.time < player.reloadAt) return;
+    if (player.ammo <= 0) {
+      player.attackCd = G.time + 0.3;
+      toast(player.reserve > 0 ? 'Magazine empty — R to reload.' : 'No ammo — Rosa\'s pad at the garage refills it.', 1.6);
+      return;
+    }
+    player.ammo--;
+    player.attackCd = G.time + 0.24;
+    NV.Sound.gunshot();
+    var p = player.mesh.position;
+    var dir = lookDir();
+    // Muzzle flash at the gun hand, lit for a few frames.
+    flashMesh.position.set(p.x + dir.x * 0.7, 1.32, p.z + dir.z * 0.7);
+    flashMesh.visible = true;
+    flashLight.position.copy(flashMesh.position);
+    flashLight.intensity = 2.4;
+    flashUntil = G.time + 0.055;
+    var origin = { x: p.x, y: 1.42, z: p.z };
+    var best = null, bestT = 70;
+    for (var i = 0; i < NV.Peds.list.length; i++) {
+      var ped = NV.Peds.list[i];
+      if (ped.state === 'down') continue;
+      var pp = ped.pos();
+      var t = aimScore(origin, dir, pp.x, 1.0, pp.z, 0.95);
+      if (t > 0 && t < bestT) { bestT = t; best = { ped: ped }; }
+    }
+    if (owner && owner.active && G.time >= owner.downUntil) {
+      var op = owner.mesh.position;
+      var ot = aimScore(origin, dir, op.x, 1.0, op.z, 0.95);
+      if (ot > 0 && ot < bestT) { bestT = ot; best = { owner: true }; }
+    }
+    var hitSomething = !!best;
+    if (!hitSomething) {
+      // Cars soak bullets with a clang and a dented panel's worth of noise.
+      var all = allCars.concat(NV.Police.cars);
+      for (var ci = 0; ci < all.length; ci++) {
+        var cp = all[ci].pos();
+        var ct = aimScore(origin, dir, cp.x, 0.75, cp.z, 2.1);
+        if (ct > 0 && ct < bestT) { bestT = ct; hitSomething = true; }
+      }
+      if (hitSomething) NV.Sound.thud(0.35);
+    }
+    if (best) hitFigure(best, true);
+    // Gunfire is the loudest crime there is: everyone runs, the PPD comes.
+    commitCrime('shooting', p);
+    NV.Peds.startleNear(p, 26);
+    if (player.ammo === 0 && player.reserve > 0) tryReload();
+  }
+
+  function tryReload() {
+    if (!player.hasPistol || player.mode !== 'foot') return;
+    if (G.time < player.reloadAt || player.ammo >= 12 || player.reserve <= 0) return;
+    player.reloadAt = G.time + 0.9;
+    NV.Sound.reloadClick();
   }
 
   // --- Per-frame updates ---------------------------------------------------------
@@ -252,6 +606,8 @@
     } else {
       NV.walkCycle(player.mesh, 0, 0);
     }
+    // A punch overrides the right arm's swing for its few frames.
+    if (G.time < player.punchUntil) player.mesh.userData.armR.rotation.x = -2.0;
     NV.resolveCircle(p, 0.45, world.colliders);
     // Cars are solid to walk into.
     for (var i = 0; i < allCars.length; i++) {
@@ -420,21 +776,240 @@
     }
   }
 
-  function updateMissions() {
+  // --- Missions -----------------------------------------------------------------
+  // Rosa Delgado's chain: two intro jobs, then a timed delivery, a hot pickup
+  // and a repo job. startMission rebuilds a mission's props; completeMission
+  // pays out, autosaves and advances. After the chain, the garage buys any
+  // stolen car for scrap, forever.
+  function missionTarget() {
+    switch (G.mission) {
+      case 0: case 1: case 5: return world.garage;
+      case 2:
+        if (G.md.stage === 'drive') return DROP_POINT;
+        if (G.md.stage === 'ready' && deliveryCar) return deliveryCar.pos();
+        return world.garage;
+      case 3: return G.md.carrying ? world.garage : PACKAGE_POINT;
+      case 4:
+        if (player.car && player.car === repoCar) return world.garage;
+        return repoCar ? repoCar.pos() : world.garage;
+    }
+    return world.garage;
+  }
+
+  function removeCar(car) {
+    if (!car) return;
+    scene.remove(car.mesh);
+    var i = allCars.indexOf(car);
+    if (i >= 0) allCars.splice(i, 1);
+  }
+
+  function startMission(idx) {
+    G.md = {};
+    if (idx === 2) {
+      // Rosa's gold car waits on the apron; the clock starts when you take it.
+      G.md.stage = 'ready';
+      G.md.timer = 0;
+      if (!deliveryCar) {
+        deliveryCar = new NV.Car(scene, {
+          x: world.garage.x - 13, z: world.garage.z + 7,
+          heading: Math.PI / 2, color: 0xe0a51f, own: true
+        });
+        allCars.push(deliveryCar);
+      }
+    } else if (idx === 3) {
+      G.md.carrying = false;
+      packageMesh.visible = true;
+    } else if (idx === 4) {
+      G.md.stolenAt = 0;
+      if (!repoCar) {
+        repoCar = new NV.Car(scene, {
+          x: REPO_SPOT.x, z: REPO_SPOT.z, heading: REPO_SPOT.heading, color: 0x744a9e
+        });
+        allCars.push(repoCar);
+      }
+      if (!owner) {
+        owner = {
+          mesh: NV.buildHumanoid(0xb03024, 0x222222, 0xc68863),
+          active: true, aggro: false, punchCd: 0, downUntil: 0, phase: 0,
+          home: { x: REPO_SPOT.x + 2.2, z: REPO_SPOT.z + 1.5 }
+        };
+        owner.mesh.position.set(owner.home.x, 0, owner.home.z);
+        scene.add(owner.mesh);
+      }
+      owner.active = true;
+      owner.aggro = false;
+    }
+    el.objective.textContent = OBJECTIVES[idx];
+  }
+
+  function completeMission(payout, line) {
+    player.money += payout;
+    NV.Sound.jingle();
+    toast(line + ' +$' + payout, 4.5);
+    G.mission++;
+    startMission(G.mission);
+    saveGame(false); // progress is banked the moment a job closes
+  }
+
+  function failDelivery(reason) {
+    if (player.car === deliveryCar) exitCar();
+    removeCar(deliveryCar);
+    deliveryCar = null;
+    G.md.stage = 'wait';
+    G.md.timer = 0;
+    toast(reason + ' Rosa: "Back to the garage. We run it again."', 4);
+  }
+
+  function updateMissions(dt) {
     var pt = playerPoint();
     var g = world.garage;
     var atGarage = NV.dist2(pt.x, pt.z, g.x, g.z) < g.r;
-    if (G.mission === 0 && atGarage) {
-      G.mission = 1;
-      player.money += 250;
-      NV.Sound.jingle();
-      toast('Delgado: "You made it. Now bring me a car — any car." +$250', 4);
-    } else if (G.mission === 1 && atGarage && player.mode === 'car' && player.car && player.car.stolen) {
-      G.mission = 2;
-      player.money += 400;
-      player.car.stolen = false; // the delivered car is Delgado's now; driving it is legal
-      NV.Sound.jingle();
-      toast('Delgado: "Clean work." +$400 — the city is yours now.', 4);
+    if (G.mission === 0) {
+      if (atGarage) {
+        completeMission(250, 'Delgado: "You made it. Now bring me a car — any car."');
+      }
+    } else if (G.mission === 1) {
+      if (atGarage && player.mode === 'car' && player.car && player.car.stolen) {
+        player.car.stolen = false; // the delivered car is Delgado's now; driving it is legal
+        completeMission(400, 'Delgado: "Clean work. Take the pistol by the door — you have earned it."');
+      }
+    } else if (G.mission === 2) {
+      if (G.md.stage === 'wait') {
+        if (atGarage) {
+          startMission(2);
+          toast('Rosa: "Gold car is fuelled. This time, beat the clock."', 3.5);
+        }
+      } else if (G.md.stage === 'ready') {
+        if (player.car === deliveryCar) {
+          G.md.stage = 'drive';
+          G.md.timer = 120;
+          toast('Rosa: "North-west corner, two minutes. Go!"', 3);
+        }
+      } else if (G.md.stage === 'drive') {
+        G.md.timer -= dt;
+        if (player.car === deliveryCar &&
+            NV.dist2(pt.x, pt.z, DROP_POINT.x, DROP_POINT.z) < DROP_POINT.r) {
+          deliveryCar.own = false; // delivered: it belongs to the buyer now
+          completeMission(700, 'The buyer counts the cash without a word.');
+        } else if (G.md.timer <= 0) {
+          failDelivery('Out of time — the buyer walked away.');
+        }
+      }
+    } else if (G.mission === 3) {
+      if (!G.md.carrying) {
+        if (player.mode === 'foot' &&
+            NV.dist2(pt.x, pt.z, PACKAGE_POINT.x, PACKAGE_POINT.z) < 2.6) {
+          G.md.carrying = true;
+          packageMesh.visible = false;
+          // The pickup is blown: three stars, right now.
+          G.wanted.heat = Math.max(G.wanted.heat, 3.1);
+          G.wanted.lastCrime = G.time;
+          NV.Peds.startleNear(pt, 15);
+          toast('Package in hand — and the whole block just called it in. Move!', 3.5);
+        }
+      } else if (atGarage) {
+        packageMesh.visible = false;
+        completeMission(800, 'Delgado: "Whatever that was, we never saw it."');
+      }
+    } else if (G.mission === 4) {
+      if (repoCar && repoCar.stolen && !G.md.stolenAt) G.md.stolenAt = G.time;
+      if (atGarage && player.mode === 'car' && player.car === repoCar) {
+        var elapsed = G.md.stolenAt ? G.time - G.md.stolenAt : 999;
+        var bonus = NV.clamp(Math.round(300 - elapsed * 2), 0, 300);
+        repoCar.stolen = false;
+        if (owner) owner.active = false;
+        if (owner) owner.mesh.visible = false;
+        completeMission(500 + bonus,
+          'Delgado: "Repo complete." (time bonus +$' + bonus + ')');
+      }
+    } else if (G.mission === 5) {
+      // Free roam loop: the garage fence buys any stolen car for scrap.
+      if (atGarage && player.mode === 'car' && player.car && player.car.stolen) {
+        player.car.stolen = false;
+        player.money += 150;
+        NV.Sound.jingle();
+        toast('Scrap sale — +$150. Delgado strips it for parts.', 3);
+      }
+    }
+  }
+
+  // The repo car's owner: he minds his car, and he minds you taking it. He
+  // chases on foot, punches when he reaches you, and gives up if you get far
+  // away or the job ends. A punch or a bullet puts him down for a while.
+  function updateOwner(dt) {
+    if (!owner || !owner.active) return;
+    var m = owner.mesh;
+    if (G.time < owner.downUntil) return; // down; the tipped mesh says it all
+    if (m.rotation.x !== 0) { m.rotation.x = 0; m.position.y = 0; }
+    var p = m.position;
+    var pt = playerPoint();
+    var carPos = repoCar ? repoCar.pos() : owner.home;
+    if (!owner.aggro) {
+      var nearCar = NV.dist2(pt.x, pt.z, carPos.x, carPos.z) < 4.5;
+      if ((repoCar && repoCar.driver === 'player') || nearCar) owner.aggro = true;
+      else {
+        // Idle: drift back to his spot beside the car.
+        var hd = NV.dist2(p.x, p.z, owner.home.x, owner.home.z);
+        if (hd > 0.4) {
+          var ha = Math.atan2(owner.home.x - p.x, owner.home.z - p.z);
+          m.rotation.y = NV.angleLerp(m.rotation.y, ha, dt * 6);
+          p.x += Math.sin(m.rotation.y) * 1.4 * dt;
+          p.z += Math.cos(m.rotation.y) * 1.4 * dt;
+          owner.phase += dt * 4.8;
+          NV.walkCycle(m, owner.phase, 1);
+        } else NV.walkCycle(m, 0, 0);
+        return;
+      }
+    }
+    var d = NV.dist2(p.x, p.z, pt.x, pt.z);
+    if (d > 60 || G.mission !== 4) { owner.aggro = false; return; }
+    var desired = Math.atan2(pt.x - p.x, pt.z - p.z);
+    m.rotation.y = NV.angleLerp(m.rotation.y, desired, dt * 8);
+    if (d > 1.6) {
+      p.x += Math.sin(m.rotation.y) * 6.1 * dt;
+      p.z += Math.cos(m.rotation.y) * 6.1 * dt;
+      NV.resolveCircle(p, 0.45, world.colliders);
+      owner.phase += dt * 11;
+      NV.walkCycle(m, owner.phase, 1.35);
+    } else if (player.mode === 'foot') {
+      owner.punchCd -= dt;
+      NV.walkCycle(m, 0, 0);
+      if (owner.punchCd <= 0) {
+        owner.punchCd = 0.85;
+        player.health -= 6;
+        NV.Sound.thud(0.55);
+        toast('The owner is laying into you — move or fight back!', 1.6);
+        // Shove the player back a step.
+        player.mesh.position.x += Math.sin(m.rotation.y) * 0.7;
+        player.mesh.position.z += Math.cos(m.rotation.y) * 0.7;
+      }
+    }
+  }
+
+  // Objective dressing: the beacon sits on the mission target, the pistol pad
+  // shows once it is earned, the flash dies, a finished reload lands.
+  function updateMissionFx(dt) {
+    var t = missionTarget();
+    if (t && G.state === 'playing') {
+      marker.visible = true;
+      marker.position.set(t.x, 0, t.z);
+      gem.rotation.y += dt * 2.4;
+      gem.position.y = 3.4 + Math.sin(G.time * 2.2) * 0.35;
+    } else {
+      marker.visible = false;
+    }
+    pistolMesh.visible = G.mission >= 2;
+    if (pistolMesh.visible) pistolMesh.rotation.y += dt * 1.2;
+    if (flashMesh.visible && G.time > flashUntil) {
+      flashMesh.visible = false;
+      flashLight.intensity = 0;
+    }
+    if (player.reloadAt && G.time >= player.reloadAt) {
+      var need = 12 - player.ammo;
+      var take = Math.min(need, player.reserve);
+      player.ammo += take;
+      player.reserve -= take;
+      player.reloadAt = 0;
     }
   }
 
@@ -452,8 +1027,24 @@
     el.objective.textContent = OBJECTIVES[G.mission];
     el.speed.textContent = (player.mode === 'car' && player.car)
       ? Math.round(Math.abs(player.car.speed) * 3.6) + ' km/h' : '';
+    // Weapon readout and crosshair, only while armed and on foot.
+    var armed = player.hasPistol && player.mode === 'foot';
+    el.weapon.textContent = !player.hasPistol ? '' :
+      (player.reloadAt && G.time < player.reloadAt) ? 'PISTOL — reloading…' :
+      'PISTOL ' + player.ammo + ' / ' + player.reserve;
+    el.crosshair.style.display = (armed && G.state === 'playing') ? 'block' : 'none';
+    // The delivery clock, while Rosa's gold car is running.
+    if (G.mission === 2 && G.md.stage === 'drive') {
+      var left = Math.max(0, Math.ceil(G.md.timer));
+      el.timer.textContent = Math.floor(left / 60) + ':' + ('0' + (left % 60)).slice(-2);
+      el.timer.style.color = left <= 20 ? '#ff7a6b' : '#ffd94d';
+    } else {
+      el.timer.textContent = '';
+    }
     if (G.state === 'playing' && player.mode === 'foot') {
-      el.prompt.textContent = nearestEnterableCar() ? 'E — enter car' : '';
+      el.prompt.textContent = nearPistol()
+        ? (player.hasPistol ? 'E — refill pistol ammo' : 'E — take the pistol')
+        : (nearestEnterableCar() ? 'E — enter car' : '');
     } else {
       el.prompt.textContent = (G.state === 'playing' && player.mode === 'car') ? 'E — exit car' : '';
     }
@@ -482,11 +1073,12 @@
       mapCtx.fillRect(X(c - NV.CITY.ROAD / 2), 0, NV.CITY.ROAD * scale, S);
       mapCtx.fillRect(0, Z(c - NV.CITY.ROAD / 2), S, NV.CITY.ROAD * scale);
     }
-    // Mission marker.
-    if (G.mission < 2) {
+    // Mission marker: the gold dot sits on whatever the objective points at.
+    var mt = missionTarget();
+    if (mt) {
       mapCtx.fillStyle = '#ffd94d';
       mapCtx.beginPath();
-      mapCtx.arc(X(world.garage.x), Z(world.garage.z), 5, 0, Math.PI * 2);
+      mapCtx.arc(X(mt.x), Z(mt.z), 5, 0, Math.PI * 2);
       mapCtx.fill();
     }
     // Traffic.
@@ -526,20 +1118,27 @@
   function headingToMapAngle(heading) { return Math.PI - heading; }
 
   // --- Main loop --------------------------------------------------------------------
-  var clock = new THREE.Clock();
-  function frame() {
-    requestAnimationFrame(frame);
-    var dt = Math.min(clock.getDelta(), 0.05);
+  // Fixed-timestep simulation: the world steps at 120 Hz from an accumulator,
+  // however fast frames actually arrive, so the game runs at the same speed at
+  // 10 fps as at 144 fps. (The old per-frame dt clamp turned low frame rates
+  // into slow motion.) Frame debt is capped at one second: past that the game
+  // sheds time instead of spiralling. A second of simulation costs a small
+  // fraction of a second of CPU, so the cap only bites when rendering itself
+  // runs under 1 fps. Rendering always draws the latest state.
+  var STEP = 1 / 120, MAX_STEPS = 120;
+  var acc = 0, lastStamp = -1;
+
+  function stepGame(dt) {
     if (G.state === 'playing') {
       G.time += dt;
       if (player.mode === 'car') updatePlayerDriving(dt);
       else { updatePlayerOnFoot(dt); NV.Sound.engine(false, 0, dt); }
       updateWorld(dt);
       updateWanted(dt);
-      updateMissions();
+      updateMissions(dt);
+      updateOwner(dt);
+      updateMissionFx(dt);
       if (player.health <= 0) respawn(world.hospital, Math.min(player.money, 100), 'WASTED');
-      updateHUD();
-      drawMinimap();
     } else if (G.state === 'title') {
       G.time += dt;
       // The city lives behind the title screen.
@@ -547,6 +1146,21 @@
       NV.Peds.update(dt, world);
     }
     updateCamera(dt);
+  }
+
+  function frame(stamp) {
+    requestAnimationFrame(frame);
+    if (lastStamp < 0) lastStamp = stamp;
+    acc += Math.min((stamp - lastStamp) / 1000, 1.0);
+    lastStamp = stamp;
+    var steps = 0;
+    while (acc >= STEP && steps < MAX_STEPS) {
+      stepGame(STEP);
+      acc -= STEP;
+      steps++;
+    }
+    if (steps === MAX_STEPS) acc = 0; // shed the debt rather than spiral
+    if (G.state === 'playing') { updateHUD(); drawMinimap(); }
     renderer.render(scene, camera);
   }
   // --- Screenshot / automated-test hook -------------------------------------
@@ -581,6 +1195,19 @@
     }
   }
 
+  // ?debug=1 exposes the live state so automated tests can verify systems
+  // (missions, saves, combat) that the HUD alone cannot show. Normal play
+  // passes no such param and gets no handle.
+  if (params.has('debug')) {
+    window.__pn = {
+      G: G, player: player, world: world, allCars: allCars, peds: NV.Peds,
+      deliveryCar: function () { return deliveryCar; },
+      repoCar: function () { return repoCar; },
+      owner: function () { return owner; },
+      saveGame: saveGame, applySave: applySave
+    };
+  }
+
   el.objective.textContent = OBJECTIVES[0];
-  frame();
+  requestAnimationFrame(frame);
 })();

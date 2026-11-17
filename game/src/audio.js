@@ -114,6 +114,56 @@ NV.Sound = {
     src.start();
   },
 
+  // Gunshot: a crack of broadband noise through a highpass, over a low sine
+  // thump that decays fast. Loud and short, like the real thing at a distance.
+  gunshot: function () {
+    if (!this.ctx || this.muted) return;
+    var t = this.ctx.currentTime;
+    var len = Math.floor(this.ctx.sampleRate * 0.16);
+    var buffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    var data = buffer.getChannelData(0);
+    for (var i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 1.6);
+    var src = this.ctx.createBufferSource();
+    src.buffer = buffer;
+    var hp = this.ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 700;
+    var gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0.65, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+    src.connect(hp); hp.connect(gain); gain.connect(this.master);
+    src.start();
+    var osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(120, t);
+    osc.frequency.exponentialRampToValueAtTime(45, t + 0.1);
+    var og = this.ctx.createGain();
+    og.gain.setValueAtTime(0.35, t);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    osc.connect(og); og.connect(this.master);
+    osc.start(t); osc.stop(t + 0.13);
+  },
+
+  // Reload: two small metallic clicks, bolt back then bolt home.
+  reloadClick: function () {
+    if (!this.ctx || this.muted) return;
+    for (var i = 0; i < 2; i++) {
+      var len = Math.floor(this.ctx.sampleRate * 0.03);
+      var buffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      var data = buffer.getChannelData(0);
+      for (var j = 0; j < len; j++) data[j] = (Math.random() * 2 - 1) * (1 - j / len);
+      var src = this.ctx.createBufferSource();
+      src.buffer = buffer;
+      var bp = this.ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 2400;
+      var gain = this.ctx.createGain();
+      gain.gain.value = 0.22;
+      src.connect(bp); bp.connect(gain); gain.connect(this.master);
+      src.start(this.ctx.currentTime + i * 0.16);
+    }
+  },
+
   // Two-note success jingle for mission rewards.
   jingle: function () {
     if (!this.ctx || this.muted) return;
